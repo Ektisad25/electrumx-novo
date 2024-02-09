@@ -55,7 +55,7 @@ class CoinError(Exception):
 class Coin:
     '''Base class of coin hierarchy.'''
 
-    SHORTNAME = "RXD"
+    SHORTNAME = "NOVO"
     NET = "mainnet"
     REORG_LIMIT = 200
     # Not sure if these are coin-specific
@@ -68,10 +68,10 @@ class Coin:
     BLOCK_PROCESSOR = block_proc.BlockProcessor
     P2PKH_VERBYTE = bytes.fromhex("00")
     P2SH_VERBYTES = [bytes.fromhex("05")]
-    RPC_PORT = 7332
-    GENESIS_HASH = ('0000000065d8ed5d8be28d6876b3ffb6'
-                    '60ac2a6c0ca59e437e1f7a6f4e003fb4')
-    GENESIS_ACTIVATION = 0
+    RPC_PORT = 8665
+    GENESIS_HASH = ('0000000000b3de1ef5bd7c20708dbafc'
+                    '3df0441877fa4a59cda22b4c2d4f39ce')
+    GENESIS_ACTIVATION = 100_000_000
     # Peer discovery
     PEER_DEFAULT_PORTS = {'t': '50001', 's': '50002'}
     PEERS = []
@@ -195,14 +195,14 @@ class Coin:
 
 
 class Radiant(Coin):
-    NAME = "Radiant"
+    NAME = "Novo"
     TX_COUNT = 1
     TX_COUNT_HEIGHT = 1
     TX_PER_BLOCK = 400
     PEERS = [
     ]
     GENESIS_ACTIVATION = 0
-    RPC_PORT = 7332
+    RPC_PORT = 8665
 
 class RadiantTestnetMixin:
     SHORTNAME = "XTN"
@@ -259,16 +259,16 @@ class RadiantScalingTestnet(RadiantTestnet):
 
 class RadiantRegtest(RadiantTestnet):
     NET = "regtest"
-    GENESIS_HASH = ('000000002008a2f4a76b850a838ae084'
-                    '994c200dc2fd354f73102298fe063a91')
+    GENESIS_HASH = (''
+                    '')
     PEERS = []
     TX_COUNT = 1
     TX_COUNT_HEIGHT = 1
     GENESIS_ACTIVATION = 0
-    RPC_PORT = 17443
+    RPC_PORT = 18665
 
 class Radiant(Coin):
-    NAME = "Radiant"
+    NAME = "NOVO"
     TX_COUNT = 1000
     TX_COUNT_HEIGHT = 2000
     TX_PER_BLOCK = 10
