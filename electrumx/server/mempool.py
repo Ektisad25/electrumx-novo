@@ -189,7 +189,7 @@ class MemPool(object):
                 tx.in_pairs = tuple(in_pairs)
                 tx.fee = max(0, (sum(v for _, v in tx.in_pairs) - sum(v for _, v in tx.out_pairs)))
                 txs[tx_hash] = tx
-                print(f"Deferred Transaction {tx_hash} accepted with fee: {tx.fee} no saturation made")
+                 #print(f"Deferred Transaction {tx_hash} accepted with fee: {tx.fee} no saturation made")
                 del deferred_txns[tx_hash]  # Remove from deferred
 
      # Try to find all prevouts so we can accept the TX
@@ -207,7 +207,7 @@ class MemPool(object):
                         utxo_map[prevout] = utxo  # Add it to utxo_map if found
 
                 if not utxo:  # If still not found, defer the transaction
-                    print(f"can be satured {tx_hash} deferred due to missing prevout: {prevout}")
+                    # print(f"can be satured {tx_hash} deferred due to missing prevout: {prevout}")
                     deferred[tx_hash] = tx
                     continue
 
@@ -227,7 +227,7 @@ class MemPool(object):
         txs[tx_hash] = tx
 
         # Log successful acceptance
-        print(f"Transaction {tx_hash} accepted with fee: {tx.fee}")
+        # print(f"Transaction {tx_hash} accepted with fee: {tx.fee}")
 
         for hashX, _value in itertools.chain(tx.in_pairs, tx.out_pairs):
             touched.add(hashX)
