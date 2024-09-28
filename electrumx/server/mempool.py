@@ -207,14 +207,14 @@ class MemPool(object):
                         utxo_map[prevout] = utxo  # Add it to utxo_map if found
 
                 if not utxo:  # If still not found, defer the transaction
-                    print(f"Transaction {tx_hash} deferred due to missing prevout: {prevout}")
+                    print(f"can be satured {tx_hash} deferred due to missing prevout: {prevout}")
                     deferred[tx_hash] = tx
                     continue
 
                 in_pairs.append(utxo)
 
         except KeyError:
-            print(f"Transaction {tx_hash} deferred due to KeyError.")
+            print(f"made saturation {tx_hash} deferred due to KeyError.")
             deferred[tx_hash] = tx
             continue
 
@@ -227,7 +227,7 @@ class MemPool(object):
         txs[tx_hash] = tx
 
         # Log successful acceptance
-        print(f"Transaction {tx_hash} accepted with fee: {tx.fee}")
+        print(f"Transaction {tx_hash} accepted with fee: {tx.fee} no saturation made")
 
         for hashX, _value in itertools.chain(tx.in_pairs, tx.out_pairs):
             touched.add(hashX)
