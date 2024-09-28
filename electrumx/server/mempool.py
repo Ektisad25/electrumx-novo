@@ -68,6 +68,7 @@ class MemPoolAPI(ABC):
 
     @abstractmethod
     async def raw_transactions(self, hex_hashes):
+        print(hex_hashes)
         '''Query bitcoind for the serialized raw transactions with the given
         hashes.  Missing transactions are returned as None.
 
@@ -115,98 +116,162 @@ class MemPool(object):
         self.refresh_secs = refresh_secs
         self.log_status_secs = log_status_secs
 
+    from asyncio import sleep
+
     async def _logging(self, synchronized_event):
-        '''Print regular logs of mempool stats.'''
-        self.logger.info('beginning processing of daemon mempool.  '
-                         'This can take some time...')
-        start = time.monotonic()
-        await synchronized_event.wait()
-        elapsed = time.monotonic() - start
-        self.logger.info(f'synced in {elapsed:.2f}s')
-        while True:
+     '''Print regular logs of mempool stats.'''
+     self.logger.info('Beginning processing of daemon mempool. '
+                     'This can take some time...')
+    
+    # Wait for synchronization to complete
+     await synchronized_event.wait()
+
+     start = time.monotonic()
+     elapsed = time.monotonic() - start
+     self.logger.info(f'Synced in {elapsed:.2f}s')
+
+     while True:
+        try:
+            # Calculate mempool stats
             mempool_size = sum(tx.size for tx in self.txs.values()) / 1_000_000
             self.logger.info(f'{len(self.txs):,d} txs {mempool_size:.2f} MB '
                              f'touching {len(self.hashXs):,d} addresses')
+
+            # Wait before the next log
             await sleep(self.log_status_secs)
-            await synchronized_event.wait()
+
+        except Exception as e:
+            self.logger.error(f'Error in logging: {e}')
+
+        # Optionally, you might want to check a condition to break out of the loop
+        # For example, you could check for a shutdown signal or event
 
     def _accept_transactions(self, tx_map, utxo_map, touched):
-        '''Accept transactions in tx_map to the mempool if all their inputs
-        can be found in the existing mempool or a utxo_map from the
-        DB.
+     '''Accept transactions in tx_map to the mempool if all their inputs
+     can be found in the existing mempool or a utxo_map from the
+    DB.
 
-        Returns an (unprocessed tx_map, unspent utxo_map) pair.
-        '''
-        hashXs = self.hashXs
-        outpointToRefs = self.outpointToRefs
-        codeScriptHashes = self.codeScriptHashes # not used yet
-        srefs = self.srefs
-        txs = self.txs
-        to_le_uint32 = pack_le_uint32
+    Returns an (unprocessed tx_map, unspent utxo_map) pair.
+    '''
+     hashXs = self.hashXs
+     outpointToRefs = self.outpointToRefs
+     srefs = self.srefs
+     txs = self.txs
+     to_le_uint32 = pack_le_uint32
 
-        deferred = {}
-        unspent = set(utxo_map)
-        # Try to find all prevouts so we can accept the TX
-        for tx_hash, tx in tx_map.items():
+     deferred = {}
+     unspent = set(utxo_map)
+
+     def process_deferred_transactions(deferred_txns):
+        '''Process the deferred transactions to see if they can now be accepted.'''
+        for tx_hash, tx in list(deferred_txns.items()):
             in_pairs = []
-            try:
-                for prevout in tx.prevouts:
-                    utxo = utxo_map.get(prevout)
-                    if not utxo:
-                        prev_hash, prev_index = prevout
-                        # Raises KeyError if prev_hash is not in txs
+            can_accept = True
+            for prevout in tx.prevouts:
+                utxo = utxo_map.get(prevout)
+                if utxo is None:
+                    prev_hash, prev_index = prevout
+                    if prev_hash in txs:  # Check if the transaction exists
                         utxo = txs[prev_hash].out_pairs[prev_index]
-                    in_pairs.append(utxo)
-            except KeyError:
-                deferred[tx_hash] = tx
-                continue
+                        utxo_map[prevout] = utxo  # Add it to utxo_map if found
 
-            # Spend the prevouts
-            unspent.difference_update(tx.prevouts)
+                if not utxo:  # Still not found, cannot accept
+                    can_accept = False
+                    break
 
-            # Save the in_pairs, compute the fee and accept the TX
-            tx.in_pairs = tuple(in_pairs)
-            # Avoid negative fees if dealing with generation-like transactions
-            # because some in_parts would be missing
-            tx.fee = max(0, (sum(v for _, v in tx.in_pairs) -
-                             sum(v for _, v in tx.out_pairs)))
-            txs[tx_hash] = tx
+                in_pairs.append(utxo)
 
-            for hashX, _value in itertools.chain(tx.in_pairs, tx.out_pairs):
-                touched.add(hashX)
-                hashXs[hashX].add(tx_hash)
+            if can_accept:
+                # Spend the prevouts
+                unspent.difference_update(tx.prevouts)
 
-            for ref_hashes in tx.out_srefs:
-                if ref_hashes:
-                    for ref_hash in ref_hashes:
-                        touched.add(ref_hash)
-                        hashXs[ref_hash].add(tx_hash)
-                        if tx_hash not in srefs[ref_hash]:
-                            srefs[ref_hash].append(tx_hash)
+                # Save the in_pairs, compute the fee and accept the TX
+                tx.in_pairs = tuple(in_pairs)
+                tx.fee = max(0, (sum(v for _, v in tx.in_pairs) - sum(v for _, v in tx.out_pairs)))
+                txs[tx_hash] = tx
+               #  print(f"Deferred Transaction {tx_hash} accepted with fee: {tx.fee}")
+                del deferred_txns[tx_hash]  # Remove from deferred
 
-            # Check every output script for refs to build up the outpointToRefs map for quickly enumering which refs
-            # are associated with each outpoint for the purposes of returning refs for unconfirmed utxos in mempool
-            out_idx = 0
-            for pk_script in tx.idx_to_script:
-                all_refs, normal_refs, singleton_refs = Script.get_push_input_refs(pk_script)
-                all_refs_dedup = Script.dedup_refs(all_refs)
-                normal_refs_dedup = Script.dedup_refs(normal_refs)
-                singleton_refs_dedup = Script.dedup_refs(singleton_refs)
-                # Save all the refs if any for the utxo
-                refs_value = b''
-                for ref_id in all_refs_dedup.keys():
-                    enc_ref_type = 0
-                    # check if it's a singleton ref by first ensuring it's not in the normal refs map
-                    if not normal_refs_dedup.get(ref_id):
-                        assert singleton_refs_dedup.get(ref_id)
-                        enc_ref_type = 1
-                    refs_value += ref_id + (enc_ref_type).to_bytes(1, "little")
-                # cache the refs for the outpoint
-                if len(refs_value):
-                    outpointToRefs[tx_hash + to_le_uint32(out_idx)] = refs_value
-                out_idx += 1 
+     # Try to find all prevouts so we can accept the TX
+     for tx_hash, tx in tx_map.items():
+        in_pairs = []
+        try:
+            for prevout in tx.prevouts:
+                utxo = utxo_map.get(prevout)
 
-        return deferred, {prevout: utxo_map[prevout] for prevout in unspent}
+                # If the UTXO is missing, try to add it to the utxo_map
+                if utxo is None:
+                    prev_hash, prev_index = prevout
+                    if prev_hash in txs:  # Check if the transaction exists
+                        utxo = txs[prev_hash].out_pairs[prev_index]
+                        utxo_map[prevout] = utxo  # Add it to utxo_map if found
+
+                if not utxo:  # If still not found, defer the transaction
+                    print(f"Transaction {tx_hash} deferred due to missing prevout: {prevout}")
+                    deferred[tx_hash] = tx
+                    continue
+
+                in_pairs.append(utxo)
+
+        except KeyError:
+            print(f"Transaction {tx_hash} deferred due to KeyError.")
+            deferred[tx_hash] = tx
+            continue
+
+        # Spend the prevouts
+        unspent.difference_update(tx.prevouts)
+
+        # Save the in_pairs, compute the fee and accept the TX
+        tx.in_pairs = tuple(in_pairs)
+        tx.fee = max(0, (sum(v for _, v in tx.in_pairs) - sum(v for _, v in tx.out_pairs)))
+        txs[tx_hash] = tx
+
+        # Log successful acceptance
+        print(f"Transaction {tx_hash} accepted with fee: {tx.fee}")
+
+        for hashX, _value in itertools.chain(tx.in_pairs, tx.out_pairs):
+            touched.add(hashX)
+            hashXs[hashX].add(tx_hash)
+
+        for ref_hashes in tx.out_srefs:
+            if ref_hashes:
+                for ref_hash in ref_hashes:
+                    touched.add(ref_hash)
+                    hashXs[ref_hash].add(tx_hash)
+                    if tx_hash not in srefs[ref_hash]:
+                        srefs[ref_hash].append(tx_hash)
+
+        # Check every output script for refs to build up the outpointToRefs map
+        out_idx = 0
+        for pk_script in tx.idx_to_script:
+            all_refs, normal_refs, singleton_refs = Script.get_push_input_refs(pk_script)
+            all_refs_dedup = Script.dedup_refs(all_refs)
+            normal_refs_dedup = Script.dedup_refs(normal_refs)
+            singleton_refs_dedup = Script.dedup_refs(singleton_refs)
+            
+            # Save all the refs if any for the utxo
+            refs_value = b''
+            for ref_id in all_refs_dedup.keys():
+                enc_ref_type = 0
+                if not normal_refs_dedup.get(ref_id):
+                    assert singleton_refs_dedup.get(ref_id)
+                    enc_ref_type = 1
+                refs_value += ref_id + (enc_ref_type).to_bytes(1, "little")
+            
+            if len(refs_value):
+                outpointToRefs[tx_hash + to_le_uint32(out_idx)] = refs_value
+            out_idx += 1 
+
+     # Introduce a delay before processing deferred transactions
+     time.sleep(2)  # Sleep for 1 second (adjust as needed)
+
+     # Process any deferred transactions that may now be accepted
+     process_deferred_transactions(deferred)
+
+     return deferred, {prevout: utxo_map[prevout] for prevout in unspent}
+
+
+
 
     async def _refresh_hashes(self, synchronized_event):
         '''Refresh our view of the daemon's mempool.'''
@@ -233,65 +298,69 @@ class MemPool(object):
             await sleep(self.refresh_secs)
 
     async def _process_mempool(self, all_hashes, touched, mempool_height):
-        # Re-sync with the new set of hashes
-        txs = self.txs
-        hashXs = self.hashXs
-        codeScriptHashes = self.codeScriptHashes # not used yet
-        outpointToRefs = self.outpointToRefs
-        to_le_uint32 = pack_le_uint32
-        srefs = self.srefs
+     # Re-sync with the new set of hashes
+     txs = self.txs
+     hashXs = self.hashXs
+     srefs = self.srefs
+     txs = self.txs
+     hashXs = self.hashXs
+     codeScriptHashes = self.codeScriptHashes # not used yet
+     outpointToRefs = self.outpointToRefs
+     to_le_uint32 = pack_le_uint32
+     srefs = self.srefs
 
-        if mempool_height != self.api.db_height():
-            raise DBSyncError
+     if mempool_height != self.api.db_height():
+        raise DBSyncError
 
-        # First handle txs that have disappeared
-        for tx_hash in set(txs).difference(all_hashes):
-            tx = txs.pop(tx_hash)
-            tx_hashXs = set(hashX for hashX, value in tx.in_pairs)
-            tx_hashXs.update(hashX for hashX, value in tx.out_pairs)
-            tx_hashXs.update(ref_hash for ref_hashes in tx.out_srefs for ref_hash in ref_hashes)
-            for hashX in tx_hashXs:
+    # Handle txs that have disappeared
+     for tx_hash in set(txs).difference(all_hashes):
+        tx = txs.pop(tx_hash)
+        tx_hashXs = set(hashX for hashX, value in tx.in_pairs)
+        tx_hashXs.update(hashX for hashX, value in tx.out_pairs)
+        tx_hashXs.update(ref_hash for ref_hashes in tx.out_srefs for ref_hash in ref_hashes)
+        
+        for hashX in tx_hashXs:
+            if hashX in hashXs and tx_hash in hashXs[hashX]:  # Check existence
                 hashXs[hashX].remove(tx_hash)
                 if not hashXs[hashX]:
                     del hashXs[hashX]
-                if tx_hash in srefs[hashX]:
-                    srefs[hashX].remove(tx_hash)
+            if tx_hash in srefs.get(hashX, []):
+                srefs[hashX].remove(tx_hash)
                 if not srefs[hashX]:
                     del srefs[hashX]
-            touched.update(tx_hashXs)
+        touched.update(tx_hashXs)
 
-            # Handle the outpoints that have disappeared from the mempool to remove the entries in outpointToRefs
-            # This maintains the outpointToRefs to always contain the unconfirmed mempool outpoints which contain refs
-            out_idx = 0
-            for _pk_script in enumerate(tx.idx_to_script):
-                outpointToRefs.pop(tx_hash + to_le_uint32(out_idx), None)
-                out_idx += 1
-                  
-        # Process new transactions
-        new_hashes = list(all_hashes.difference(txs))
-        if new_hashes:
-            group = TaskGroup()
-            for hashes in chunks(new_hashes, 200):
-                coro = self._fetch_and_accept(hashes, all_hashes, touched)
-                await group.spawn(coro)
+        # Handle the outpoints that have disappeared from the mempool
+        out_idx = 0
+        for _pk_script in enumerate(tx.idx_to_script):
+            outpointToRefs.pop(tx_hash + to_le_uint32(out_idx), None)
+            out_idx += 1
 
-            tx_map = {}
-            utxo_map = {}
-            async for task in group:
-                deferred, unspent = task.result()
-                tx_map.update(deferred)
-                utxo_map.update(unspent)
+    # Process new transactions
+     new_hashes = list(all_hashes.difference(txs))
+     if new_hashes:
+        group = TaskGroup()
+        for hashes in chunks(new_hashes, 200):
+            coro = self._fetch_and_accept(hashes, all_hashes, touched)
+            await group.spawn(coro)
 
-            prior_count = 0
-            # FIXME: this is not particularly efficient
-            while tx_map and len(tx_map) != prior_count:
-                prior_count = len(tx_map)
-                tx_map, utxo_map = self._accept_transactions(tx_map, utxo_map,
-                                                             touched)
-            if tx_map:
-                self.logger.error(f'{len(tx_map)} txs dropped')
+        tx_map = {}
+        utxo_map = {}
+        async for task in group:
+            deferred, unspent = task.result()
+            tx_map.update(deferred)
+            utxo_map.update(unspent)
 
-        return touched
+        prior_count = 0
+        while tx_map and len(tx_map) != prior_count:
+            prior_count = len(tx_map)
+            tx_map, utxo_map = self._accept_transactions(tx_map, utxo_map, touched)
+
+        if tx_map:
+            self.logger.error(f'{len(tx_map)} txs dropped')
+
+     return touched
+
 
     async def _fetch_and_accept(self, hashes, all_hashes, touched):
         '''Fetch a list of mempool transactions.'''
