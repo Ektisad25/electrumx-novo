@@ -48,7 +48,7 @@ RUN mkdir /root/electrumdb
 WORKDIR /root
 
 # ORIGINAL SOURCE
-RUN git clone --depth 1 --branch master https://github.com/radiantblockchain/electrumx.git
+RUN git clone --depth 1 --branch master https://github.com/Ektisad25/electrumx.git
 
 WORKDIR /root/electrumx
 
