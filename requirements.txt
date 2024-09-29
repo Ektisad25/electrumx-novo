@@ -4,3 +4,4 @@ plyvel
 pylru
 aiohttp>=3.3,<4.0
 websockets
+psutil
