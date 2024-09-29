@@ -104,9 +104,30 @@ OpCodes = Enumeration("Opcodes", [
     ("OP_CODESCRIPTHASHZEROVALUEDOUTPUTCOUNT_OUTPUTS", 232),
     ("OP_CODESCRIPTBYTECODE_UTXO", 233),
     ("OP_CODESCRIPTBYTECODE_OUTPUT", 234),
-    ("OP_STATECRIPTBYTECODE_UTXO", 235),
-    ("OP_STATECRIPTBYTECODE_OUTPUT", 236),
+    ("OP_STATESCRIPTBYTECODE_UTXO", 235),
+    ("OP_STATESCRIPTBYTECODE_OUTPUT", 236),
+    ("OP_PUSH_TX_STATE", 237)
 ])
+
+# Cached in hash set for improved parsing performance
+INPUT_REF_OPS = {
+    OpCodes.OP_PUSHINPUTREF,
+    OpCodes.OP_PUSHINPUTREFSINGLETON,
+    OpCodes.OP_REQUIREINPUTREF,
+    OpCodes.OP_DISALLOWPUSHINPUTREF,
+    OpCodes.OP_DISALLOWPUSHINPUTREFSIBLING,
+}
+PUSH_INPUT_REF_OPS = {
+    OpCodes.OP_PUSHINPUTREF,
+    OpCodes.OP_PUSHINPUTREFSINGLETON
+}
+CHECKSIG_OPS = {
+    OpCodes.OP_CHECKSIG,
+    OpCodes.OP_CHECKSIGVERIFY,
+    OpCodes.OP_CHECKMULTISIG,
+    OpCodes.OP_CHECKMULTISIGVERIFY
+}
+
 
 # Paranoia to make it hard to create bad scripts
 assert OpCodes.OP_DUP == 0x76
@@ -153,8 +174,9 @@ assert OpCodes.OP_CODESCRIPTHASHZEROVALUEDOUTPUTCOUNT_UTXOS == 0xe7
 assert OpCodes.OP_CODESCRIPTHASHZEROVALUEDOUTPUTCOUNT_OUTPUTS == 0xe8
 assert OpCodes.OP_CODESCRIPTBYTECODE_UTXO == 0xe9
 assert OpCodes.OP_CODESCRIPTBYTECODE_OUTPUT == 0xea
-assert OpCodes.OP_STATECRIPTBYTECODE_UTXO == 0xeb
-assert OpCodes.OP_STATECRIPTBYTECODE_OUTPUT == 0xec
+assert OpCodes.OP_STATESCRIPTBYTECODE_UTXO == 0xeb
+assert OpCodes.OP_STATESCRIPTBYTECODE_OUTPUT == 0xec
+assert OpCodes.OP_PUSH_TX_STATE == 0xed
 
 def is_unspendable_legacy(script):
     # OP_FALSE OP_RETURN or OP_RETURN
@@ -205,12 +227,53 @@ class ScriptPubKey(object):
 class Script(object):
 
     @classmethod
+    def get_stateseperator_index(cls, script):
+        try:
+            n = 0
+            while n < len(script):
+                op = script[n]
+                # Found the state seperator
+                if op == OpCodes.OP_STATESEPERATOR:
+                    return n
+                
+                n += 1
+                if op <= OpCodes.OP_PUSHDATA4:
+                    # Raw bytes follow
+                    if op < OpCodes.OP_PUSHDATA1:
+                        dlen = op
+                    elif op == OpCodes.OP_PUSHDATA1:
+                        dlen = script[n]
+                        n += 1
+                    elif op == OpCodes.OP_PUSHDATA2:
+                        dlen, = unpack_le_uint16_from(script[n: n + 2])
+                        n += 2
+                    elif op == OpCodes.OP_PUSHDATA4:
+                        dlen, = unpack_le_uint32_from(script[n: n + 4])
+                        n += 4
+                    if n + dlen > len(script):
+                        raise IndexError
+                    n += dlen 
+
+                elif op == OpCodes.OP_PUSHINPUTREF or op == OpCodes.OP_REQUIREINPUTREF or op == OpCodes.OP_DISALLOWPUSHINPUTREF or op == OpCodes.OP_DISALLOWPUSHINPUTREFSIBLING or op == OpCodes.OP_PUSHINPUTREFSINGLETON:
+                    dlen = 36 # Grab 36 bytes for the hash
+                    if n + dlen > len(script):
+                        raise IndexError
+                    n += dlen 
+
+        except Exception as e:
+            print(f'e {e}')
+            raise ScriptError('truncated script') from None
+        # No state seperator found
+        return 0
+
+    @classmethod
     def get_ops(cls, script):
         ops = []
 
         # The unpacks or script[n] below throw on truncated scripts
         try:
             n = 0
+            dlen = 0
             while n < len(script):
                 op = script[n]
                 n += 1
@@ -228,14 +291,21 @@ class Script(object):
                     elif op == OpCodes.OP_PUSHDATA4:
                         dlen, = unpack_le_uint32_from(script[n: n + 4])
                         n += 4
-                    elif op == OpCodes.OP_PUSHINPUTREF or op == OpCodes.OP_REQUIREINPUTREF or op == OpCodes.OP_DISALLOWPUSHINPUTREF or op == OpCodes.OP_DISALLOWPUSHINPUTREFSIBLING or op == OpCodes.OP_PUSHINPUTREFSINGLETON:
-                        dlen = 36 # Grab 36 bytes for the hash
+
                     if n + dlen > len(script):
                         raise IndexError
 
                     op = (op, script[n:n + dlen])
                     n += dlen
 
+                elif op in INPUT_REF_OPS:
+                    dlen = 36  # Grab 36 bytes for the hash
+
+                    if n + dlen > len(script):
+                        raise IndexError
+                    n += dlen 
+
+                op = (op, script[n:n + dlen])
                 ops.append(op)
         except Exception:
             # Truncated script; e.g. tx_hash
@@ -243,15 +313,17 @@ class Script(object):
             raise ScriptError('truncated script') from None
 
         return ops
-
     # Saves the push input refs of a script in the order they were encountered
     @classmethod
     def get_push_input_refs(cls, script):
-        push_input_refs = []
+        all_refs = []
+        normal_refs = []
+        singleton_refs = []
 
         # The unpacks or script[n] below throw on truncated scripts
         try:
             n = 0
+            dlen = 0
             while n < len(script):
                 op = script[n]
                 n += 1
@@ -269,26 +341,96 @@ class Script(object):
                     elif op == OpCodes.OP_PUSHDATA4:
                         dlen, = unpack_le_uint32_from(script[n: n + 4])
                         n += 4
-                    if n + dlen > len(script):
-                        raise IndexError
-                
-                    n += dlen 
-                    
-                if op == OpCodes.OP_PUSHINPUTREF or op == OpCodes.OP_REQUIREINPUTREF or op == OpCodes.OP_DISALLOWPUSHINPUTREF or op == OpCodes.OP_DISALLOWPUSHINPUTREFSIBLING or op == OpCodes.OP_PUSHINPUTREFSINGLETON:
-                    dlen = 36 # Grab 36 bytes
-                
-                    if op == OpCodes.OP_PUSHINPUTREF or op == OpCodes.OP_PUSHINPUTREFSINGLETON:
-                        push_input_refs.append(script[n:n + dlen]) 
 
                     if n + dlen > len(script):
                         raise IndexError
 
-                    n += dlen  
+                    n += dlen
+
+                elif op in INPUT_REF_OPS:
+                    dlen = 36  # Grab 36 bytes
+
+                    if op == OpCodes.OP_PUSHINPUTREF:
+                        ref = script[n:n + dlen]
+                        all_refs.append(ref)
+                        normal_refs.append(ref)
+                    elif op == OpCodes.OP_PUSHINPUTREFSINGLETON:
+                        ref = script[n:n + dlen]
+                        all_refs.append(ref)
+                        singleton_refs.append(ref)
+
+                    if n + dlen > len(script):
+                        raise IndexError
+
+                    n += dlen
 
         except Exception as e:
             raise ScriptError('get_push_input_refs script') from None
 
-        return push_input_refs
+        return all_refs, normal_refs, singleton_refs
+    
+    @classmethod 
+    def dedup_refs(cls, refs_list):
+        dedup = {}
+        for ref in refs_list: 
+            dedup[ref] = ref
+        return dedup
+
+
+    @classmethod
+    def zero_refs(cls, script):
+        ops = bytearray()
+        requires_sig = False
+
+        # The unpacks or script[n] below throw on truncated scripts
+        try:
+            n = 0
+            dlen = 0
+            while n < len(script):
+                op = script[n]
+                ops.append(op)
+                n += 1
+
+                # Refs are only zeroed when a check sig opcode is used
+                if op in CHECKSIG_OPS:
+                    requires_sig = True
+
+                elif op <= OpCodes.OP_PUSHDATA4:
+                    # Raw bytes follow
+                    if op < OpCodes.OP_PUSHDATA1:
+                        dlen = op
+                    elif op == OpCodes.OP_PUSHDATA1:
+                        dlen = script[n]
+                        n += 1
+                    elif op == OpCodes.OP_PUSHDATA2:
+                        dlen, = unpack_le_uint16_from(script[n: n + 2])
+                        n += 2
+                    elif op == OpCodes.OP_PUSHDATA4:
+                        dlen, = unpack_le_uint32_from(script[n: n + 4])
+                        n += 4
+                    if n + dlen > len(script):
+                        raise IndexError
+
+                    ops.extend(script[n:n + dlen])
+                    n += dlen
+
+                elif op in INPUT_REF_OPS:
+                    dlen = 36  # Grab 36 bytes
+
+                    if n + dlen > len(script):
+                        raise IndexError
+
+                    ops.extend(bytes(36))
+                    n += dlen
+
+        except Exception:
+            # Truncated script; e.g. tx_hash
+            # ebc9fa1196a59e192352d76c0f6e73167046b9d37b8302b6bb6968dfd279b767
+            raise ScriptError('truncated script') from None
+
+        if requires_sig:
+            return bytes(ops)
+        return script
 
     @classmethod
     def push_data(cls, data):

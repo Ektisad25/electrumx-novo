@@ -10,6 +10,7 @@
 
 
 import asyncio
+import logging
 import time
 from asyncio import sleep
 
@@ -18,12 +19,11 @@ from aiorpcx import TaskGroup, CancelledError
 import electrumx
 from electrumx.server.daemon import DaemonError
 from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
-from electrumx.lib.script import is_unspendable_legacy, is_unspendable_genesis
+from electrumx.lib.script import is_unspendable_legacy, is_unspendable_genesis, Script
 from electrumx.lib.util import (
-    class_logger, pack_le_uint32, pack_le_uint64, unpack_le_uint64
+    class_logger, pack_le_uint32, pack_le_uint64, unpack_le_uint64, unpack_le_uint32_from
 )
 from electrumx.server.db import FlushData
-
 
 class Prefetcher:
     '''Prefetches blocks (in the forward direction only).'''
@@ -192,6 +192,8 @@ class BlockProcessor:
 
         # UTXO cache
         self.utxo_cache = {}
+        self.ref_cache = {}
+        self.data_cache = {}
         self.db_deletes = []
 
     async def run_with_lock(self, coro):
@@ -307,7 +309,7 @@ class BlockProcessor:
         '''The data for a flush.  The lock must be taken.'''
         assert self.state_lock.locked()
         return FlushData(self.height, self.tx_count, self.headers,
-                         self.tx_hashes, self.undo_infos, self.utxo_cache,
+                         self.tx_hashes, self.undo_infos, self.utxo_cache, self.ref_cache, self.data_cache,
                          self.db_deletes, self.tip)
 
     async def flush(self, flush_utxos):
@@ -320,18 +322,20 @@ class BlockProcessor:
         # requesting size from Python (see deep_getsizeof).
         one_MB = 1000*1000
         utxo_cache_size = len(self.utxo_cache) * 205
+        ref_cache_size = len(self.ref_cache) * 38 + (37 * 3) # Assume there are on average 3 refs per utxo when at least 1 ref found
         db_deletes_size = len(self.db_deletes) * 57
         hist_cache_size = self.db.history.unflushed_memsize()
         # Roughly ntxs * 32 + nblocks * 42
         tx_hash_size = ((self.tx_count - self.db.fs_tx_count) * 32
                         + (self.height - self.db.fs_height) * 42)
         utxo_MB = (db_deletes_size + utxo_cache_size) // one_MB
+        ref_MB =  (ref_cache_size) // one_MB
         hist_MB = (hist_cache_size + tx_hash_size) // one_MB
 
         self.logger.info('our height: {:,d} daemon: {:,d} '
-                         'UTXOs {:,d}MB hist {:,d}MB'
+                         'UTXOs {:,d}MB hist {:,d}MB refs {:,d}MB'
                          .format(self.height, self.daemon.cached_height(),
-                                 utxo_MB, hist_MB))
+                                 utxo_MB, hist_MB, ref_MB))
 
         # Flush history if it takes up over 20% of cache memory.
         # Flush UTXOs once they take up 80% of cache memory.
@@ -377,8 +381,7 @@ class BlockProcessor:
         min_height = self.db.min_undo_height(self.daemon.cached_height())
         height = self.height + 1
 
-        is_unspendable = (is_unspendable_genesis if height >= self.coin.GENESIS_ACTIVATION
-                          else is_unspendable_legacy)
+        is_unspendable = is_unspendable_legacy
         undo_info = self.advance_txs(block.transactions, is_unspendable)
         if height >= min_height:
             self.undo_infos.append((undo_info, height))
@@ -391,21 +394,25 @@ class BlockProcessor:
         await sleep(0)
 
     def advance_txs(self, txs, is_unspendable):
-        self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
+     self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
 
-        # Use local vars for speed in the loops
-        undo_info = []
-        tx_num = self.tx_count
-        script_hashX = self.coin.hashX_from_script
-        put_utxo = self.utxo_cache.__setitem__
-        spend_utxo = self.spend_utxo
-        undo_info_append = undo_info.append
-        update_touched = self.touched.update
-        hashXs_by_tx = []
-        append_hashXs = hashXs_by_tx.append
-        to_le_uint32 = pack_le_uint32
-        to_le_uint64 = pack_le_uint64
+     # Use local vars for speed in the loops
+     undo_info = []
+     tx_num = self.tx_count
+     script_hashX = self.coin.hashX_from_script
+     script_codeScriptHash = self.coin.codeScriptHash_from_script
+     put_utxo = self.utxo_cache.__setitem__
+     put_refs = self.ref_cache.__setitem__
+     put_data = self.data_cache.__setitem__
+     spend_utxo = self.spend_utxo
+     undo_info_append = undo_info.append
+     update_touched = self.touched.update
+     hashXs_by_tx = []
+     append_hashXs = hashXs_by_tx.append
+     to_le_uint32 = pack_le_uint32
+     to_le_uint64 = pack_le_uint64
 
+     try:
         for tx, tx_hash in txs:
             hashXs = []
             append_hashX = hashXs.append
@@ -415,32 +422,83 @@ class BlockProcessor:
             for txin in tx.inputs:
                 if txin.is_generation():
                     continue
-                cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
-                undo_info_append(cache_value)
-                append_hashX(cache_value[:-13])
+                try:
+                    cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
+                    undo_info_append(cache_value)
+                    append_hashX(cache_value[:HASHX_LEN])
+                except KeyError as e:
+                    # Log or handle missing UTXO error
+                    logging.error(f"Error spending UTXO for input {txin.prev_hash}: {str(e)}")
+                    raise
 
             # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
-                # Ignore unspendable outputs
                 if is_unspendable(txout.pk_script):
                     continue
 
-                # Get the hashX
-                hashX = script_hashX(txout.pk_script)
-                append_hashX(hashX)
-                put_utxo(tx_hash + to_le_uint32(idx),
-                         hashX + tx_numb + to_le_uint64(txout.value))
+                try:
+                    # Get the hashX
+                    zero_refs = Script.zero_refs(txout.pk_script)
+                    hashX = script_hashX(zero_refs)
+                    codeScriptHash = script_codeScriptHash(txout.pk_script)
+                    append_hashX(hashX)
 
+                    # Store UTXO
+                    put_utxo(tx_hash + to_le_uint32(idx),
+                             hashX + codeScriptHash + tx_numb + to_le_uint64(txout.value))
+
+                    # Process refs
+                    all_refs, normal_refs, singleton_refs = Script.get_push_input_refs(txout.pk_script)
+                    all_refs_dedup = Script.dedup_refs(all_refs)
+                    normal_refs_dedup = Script.dedup_refs(normal_refs)
+                    singleton_refs_dedup = Script.dedup_refs(singleton_refs)
+
+                    # Save all refs if present
+                    refs_value = b''
+                    for ref_id in all_refs_dedup.keys():
+                        enc_ref_type = 0
+                        # If it's a singleton ref and not a normal ref
+                        if not normal_refs_dedup.get(ref_id):
+                            assert singleton_refs_dedup.get(ref_id), "Ref inconsistency"
+                            enc_ref_type = 1
+                        refs_value += ref_id + (enc_ref_type).to_bytes(1, "little")
+
+                    # Save the refs for the outpoint
+                    if refs_value:
+                        put_refs(tx_hash + to_le_uint32(idx), refs_value)
+
+                    # Track history for singleton refs
+                    ref_hashes = [script_hashX(ref) for ref in singleton_refs_dedup.keys()]
+                    for ref_hash in ref_hashes:
+                        append_hashX(ref_hash)
+
+                    # Track history for normal refs
+                    for ref in normal_refs_dedup.keys():
+                        for txin in tx.inputs:
+                            if txin.prev_hash == ref[:32] and to_le_uint32(txin.prev_idx) == ref[32:]:
+                                append_hashX(script_hashX(ref))
+
+                except Exception as e:
+                    # Catch any unexpected errors in processing the UTXO
+                    logging.error(f"Error processing UTXO for {tx_hash}: {str(e)}")
+                    raise
+
+            # Append and update touched hashX
             append_hashXs(hashXs)
             update_touched(hashXs)
             tx_num += 1
 
+        # Update DB history
         self.db.history.add_unflushed(hashXs_by_tx, self.tx_count)
-
         self.tx_count = tx_num
         self.db.tx_counts.append(tx_num)
 
-        return undo_info
+     except Exception as e:
+        logging.error(f"Critical error advancing transactions: {str(e)}")
+        raise
+
+     return undo_info
+
 
     async def _backup_block(self, raw_block):
         '''Backup the raw block and flush.
@@ -463,8 +521,7 @@ class BlockProcessor:
                                      hash_to_hex_str(self.tip),
                                      self.height))
         self.tip = coin.header_prevhash(block.header)
-        is_unspendable = (is_unspendable_genesis if self.height >= genesis_activation
-                          else is_unspendable_legacy)
+        is_unspendable = is_unspendable_legacy
         self._backup_txs(block.transactions, is_unspendable)
         self.height -= 1
         self.db.tx_counts.pop()
@@ -472,6 +529,7 @@ class BlockProcessor:
         await sleep(0)
 
     def _backup_txs(self, txs, is_unspendable):
+        to_le_uint32 = pack_le_uint32
         # Prevout values, in order down the block (coinbase first if present)
         # undo_info is in reverse block order
         undo_info = self.db.read_undo_info(self.height)
@@ -484,7 +542,8 @@ class BlockProcessor:
         put_utxo = self.utxo_cache.__setitem__
         spend_utxo = self.spend_utxo
         touched = self.touched
-        undo_entry_len = 13 + HASHX_LEN
+        undo_entry_len = 13 + HASHX_LEN + 32 # 32 added for codScriptHash
+        script_hashX = self.coin.hashX_from_script
 
         for tx, tx_hash in reversed(txs):
             for idx, txout in enumerate(tx.outputs):
@@ -494,7 +553,21 @@ class BlockProcessor:
                     continue
 
                 cache_value = spend_utxo(tx_hash, idx)
-                touched.add(cache_value[:-13])
+                touched.add(cache_value[:HASHX_LEN])
+                
+                # Delete any refs for outpoint
+                self.delete_potential_refs(tx_hash, idx)
+
+                normal_refs, singleton_refs = Script.get_push_input_refs(txout.pk_script)[1:]
+                # Add history for all singleton refs
+                for ref_hash in singleton_refs:
+                    touched.add(script_hashX(ref_hash))
+
+                # Add history for all normal refs
+                for ref in normal_refs:
+                    for txin in tx.inputs:
+                        if txin.prev_hash == ref[:32] and to_le_uint32(txin.prev_idx) == ref[32:]:
+                            touched(script_hashX(ref))
 
             # Restore the inputs
             for txin in reversed(tx.inputs):
@@ -503,7 +576,7 @@ class BlockProcessor:
                 n -= undo_entry_len
                 undo_item = undo_info[n:n + undo_entry_len]
                 put_utxo(txin.prev_hash + pack_le_uint32(txin.prev_idx), undo_item)
-                touched.add(undo_item[:-13])
+                touched.add(undo_item[:HASHX_LEN])
 
         assert n == 0
         self.tx_count -= len(txs)
@@ -552,7 +625,20 @@ class BlockProcessor:
           Value: the UTXO value as a 64-bit unsigned integer
 
       2.  Key: b'h' + compressed_tx_hash + tx_idx + tx_num
-          Value: hashX
+          Value: hashX + codeScriptHash
+
+          **Note: Added "codeScriptHash" to support creation of the tables below for Radiant references.
+          
+    The UTXO database format also must be able to do a few things efficiently for Radiant references:
+
+        1. Given a codeScriptHash be able to list UTXOS and their values 
+
+        2. ...
+
+    To this end we maintain additional 'tables", one for each point above:
+
+        1. Key: b'cu' + codeScriptHash + tx_idx + tx_num
+          Value: the UTXO value as a 64-bit unsigned integer
 
     The compressed tx hash is just the first few bytes of the hash of
     the tx in which the UTXO was created.  As this is not unique there
@@ -563,48 +649,104 @@ class BlockProcessor:
     '''
 
     def spend_utxo(self, tx_hash, tx_idx):
-        '''Spend a UTXO and return the 33-byte value.
+     '''Spend a UTXO and return the 33-byte value.
 
-        If the UTXO is not in the cache it must be on disk.  We store
-        all UTXOs so not finding one indicates a logic error or DB
-        corruption.
-        '''
-        # Fast track is it being in the cache
+    If the UTXO is not in the cache it must be on disk. We store
+    all UTXOs so not finding one indicates a logic error or DB
+    corruption.
+    '''
+     try:
+        # Fast track: check if it's in the cache
         idx_packed = pack_le_uint32(tx_idx)
         cache_value = self.utxo_cache.pop(tx_hash + idx_packed, None)
         if cache_value:
+            logging.debug(f"UTXO found in cache for tx {tx_hash.hex()}, index {tx_idx}")
             return cache_value
 
         # Spend it from the DB.
-
         # Key: b'h' + compressed_tx_hash + tx_idx + tx_num
-        # Value: hashX
+        # Value: hashX + codeScriptHash
         prefix = b'h' + tx_hash[:4] + idx_packed
-        candidates = {db_key: hashX for db_key, hashX
+        candidates = {db_key: hashX_with_codescripthash for db_key, hashX_with_codescripthash
                       in self.db.utxo_db.iterator(prefix=prefix)}
 
-        for hdb_key, hashX in candidates.items():
+        if not candidates:
+            raise ChainError(f'UTXO {hash_to_hex_str(tx_hash)} / {tx_idx} not found in DB.')
+
+        for hdb_key, hashX_with_codescripthash in candidates.items():
             tx_num_packed = hdb_key[-5:]
 
+            # Handle multiple candidates by checking transaction numbers
             if len(candidates) > 1:
                 tx_num, = unpack_le_uint64(tx_num_packed + bytes(3))
                 fs_hash, _height = self.db.fs_tx_hash(tx_num)
                 if fs_hash != tx_hash:
-                    assert fs_hash is not None  # Should always be found
+                    if fs_hash is None:
+                        raise ChainError(f"Transaction number {tx_num} not found for tx_hash {tx_hash.hex()}")
                     continue
+
+            hashX = hashX_with_codescripthash[:HASHX_LEN]
+            codeScriptHash = hashX_with_codescripthash[HASHX_LEN:]
 
             # Key: b'u' + address_hashX + tx_idx + tx_num
             # Value: the UTXO value as a 64-bit unsigned integer
             udb_key = b'u' + hashX + hdb_key[-9:]
             utxo_value_packed = self.db.utxo_db.get(udb_key)
+
             if utxo_value_packed:
-                # Remove both entries for this UTXO
+                # Remove all entries for this UTXO
                 self.db_deletes.append(hdb_key)
                 self.db_deletes.append(udb_key)
-                return hashX + tx_num_packed + utxo_value_packed
+                logging.debug(f"UTXO spent for tx_hash {tx_hash.hex()}, index {tx_idx}")
+                return hashX + codeScriptHash + tx_num_packed + utxo_value_packed
 
-        raise ChainError('UTXO {} / {:,d} not found in "h" table'
-                         .format(hash_to_hex_str(tx_hash), tx_idx))
+        # If we reach this point, no matching UTXO was found in the database
+        raise ChainError(f'UTXO {hash_to_hex_str(tx_hash)} / {tx_idx} not found in DB.')
+
+     except ChainError as e:
+        logging.error(f"Error in spending UTXO: {str(e)}")
+        raise
+
+     except Exception as e:
+        logging.error(f"Unexpected error in spend_utxo for tx_hash {tx_hash.hex()}, index {tx_idx}: {str(e)}")
+        raise ChainError(f"Unexpected error while spending UTXO {tx_hash.hex()} / {tx_idx}")
+
+
+    def delete_potential_refs(self, tx_hash, tx_idx):
+     '''Spend potential refs at an outpoint by removing them from the cache and DB.'''
+     try:
+        idx_packed = pack_le_uint32(tx_idx)
+        outpoint = tx_hash + idx_packed
+        
+        # Check and remove from the cache
+        cached_value = self.ref_cache.pop(outpoint, None)
+        
+        # Define the DB key for potential refs
+        ri_db_key = b'ri' + outpoint
+        
+        # Check if the value exists in the database
+        ref_value_packed = self.db.utxo_db.get(ri_db_key)
+        
+        # If found in both cache and DB, this indicates a critical inconsistency
+        if cached_value and ref_value_packed:
+            raise IndexError(f'Critical Error: Ref found in both cache and DB for {tx_hash.hex()}:{tx_idx}')
+        
+        # If the value exists in the DB, mark it for deletion
+        if ref_value_packed:
+            self.db_deletes.append(ri_db_key)
+            logging.debug(f'Ref removed from DB for {tx_hash.hex()}:{tx_idx}')
+        elif cached_value:
+            logging.debug(f'Ref removed from cache for {tx_hash.hex()}:{tx_idx}')
+        else:
+            logging.info(f'No ref found in cache or DB for {tx_hash.hex()}:{tx_idx}')
+
+     except IndexError as e:
+        logging.error(f"IndexError in delete_potential_refs: {str(e)}")
+        raise
+
+     except Exception as e:
+        logging.error(f"Unexpected error in delete_potential_refs for {tx_hash.hex()}:{tx_idx}: {str(e)}")
+        raise
 
     async def _process_blocks(self):
         '''Loop forever processing blocks as they arrive.'''

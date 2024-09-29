@@ -21,7 +21,7 @@ import attr
 from aiorpcx import run_in_thread, sleep
 
 from electrumx.lib import util
-from electrumx.lib.hash import hash_to_hex_str
+from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 from electrumx.lib.merkle import Merkle, MerkleCache
 from electrumx.lib.util import (
     formatted_time, pack_be_uint16, pack_be_uint32, pack_le_uint32,
@@ -30,6 +30,9 @@ from electrumx.lib.util import (
 from electrumx.server.storage import db_class
 from electrumx.server.history import History
 
+from electrumx.lib.util import (
+    unpack_le_uint32_from
+)
 
 UTXO = namedtuple("UTXO", "tx_num tx_pos tx_hash height value")
 
@@ -43,6 +46,8 @@ class FlushData(object):
     # The following are flushed to the UTXO DB if undo_infos is not None
     undo_infos = attr.ib()
     adds = attr.ib()
+    ref_adds = attr.ib()
+    data_adds = attr.ib()
     deletes = attr.ib()
     tip = attr.ib()
 
@@ -177,6 +182,8 @@ class DB(object):
         assert not flush_data.headers
         assert not flush_data.block_tx_hashes
         assert not flush_data.adds
+        assert not flush_data.ref_adds
+        assert not flush_data.data_adds
         assert not flush_data.deletes
         assert not flush_data.undo_infos
         self.history.assert_flushed()
@@ -273,6 +280,8 @@ class DB(object):
         # may be in the DB already.
         start_time = time.monotonic()
         add_count = len(flush_data.adds)
+        ref_add_count = len(flush_data.ref_adds)
+        data_add_count = len(flush_data.data_adds)
         spend_count = len(flush_data.deletes) // 2
 
         # Spends
@@ -285,11 +294,24 @@ class DB(object):
         batch_put = batch.put
         for key, value in flush_data.adds.items():
             # suffix = tx_idx + tx_num
-            hashX = value[:-13]
+            hashX = value[:11]
+            codeScriptHash = value[11:43]
             suffix = key[-4:] + value[-13:-8]
-            batch_put(b'h' + key[:4] + suffix, hashX)
+            batch_put(b'h' + key[:4] + suffix, hashX + codeScriptHash)
             batch_put(b'u' + hashX + suffix, value[-8:])
         flush_data.adds.clear()
+
+        # New Refs
+        batch_put = batch.put
+        for key, value in flush_data.ref_adds.items():
+            batch_put(b'ri' + key, value)
+        flush_data.ref_adds.clear()
+
+        # New data
+        batch_put = batch.put
+        for key, value in flush_data.data_adds.items():
+            batch_put(key, value)
+        flush_data.data_adds.clear()
 
         # New undo information
         self.flush_undo_infos(batch_put, flush_data.undo_infos)
@@ -300,7 +322,7 @@ class DB(object):
             tx_count = flush_data.tx_count - self.db_tx_count
             elapsed = time.monotonic() - start_time
             self.logger.info(f'flushed {block_count:,d} blocks with '
-                             f'{tx_count:,d} txs, {add_count:,d} UTXO adds, '
+                             f'{tx_count:,d} txs, {add_count:,d} UTXO adds, {ref_add_count:,d} ref adds, {data_add_count:,d} data adds, '
                              f'{spend_count:,d} spends in '
                              f'{elapsed:.1f}s, committing...')
 
@@ -421,7 +443,7 @@ class DB(object):
 
         return [self.coin.header_hash(header) for header in headers]
 
-    async def limited_history(self, hashX, *, limit=1000):
+    async def limited_history(self, hashX, *, limit=1000, reverse=False):
         '''Return an unpruned, sorted list of (tx_hash, height) tuples of
         confirmed transactions that touched the address, earliest in
         the blockchain first.  Includes both spending and receiving
@@ -429,7 +451,7 @@ class DB(object):
         limit to None to get them all.
         '''
         def read_history():
-            tx_nums = list(self.history.get_txnums(hashX, limit))
+            tx_nums = list(self.history.get_txnums(hashX, limit, reverse))
             fs_tx_hash = self.fs_tx_hash
             return [fs_tx_hash(tx_num) for tx_num in tx_nums]
 
@@ -696,6 +718,29 @@ class DB(object):
             self.logger.warning('all_utxos: tx hash not found (reorg?), retrying...')
             await sleep(0.25)
 
+    async def codescripthash_all_utxos(self, codeScriptHash):
+        '''Return all UTXOs for a codescripthash sorted in no particular order.'''
+        def read_utxos():
+            utxos = []
+            utxos_append = utxos.append
+            # Key: b'cu' + codeScriptHash + tx_idx + tx_num
+            # Value: the UTXO value as a 64-bit unsigned integer
+            prefix = b'cu' + codeScriptHash
+            for db_key, db_value in self.utxo_db.iterator(prefix=prefix):
+                tx_pos, = unpack_le_uint32(db_key[-9:-5])
+                tx_num, = unpack_le_uint64(db_key[-5:] + bytes(3))
+                value, = unpack_le_uint64(db_value)
+                tx_hash, height = self.fs_tx_hash(tx_num)
+                utxos_append(UTXO(tx_num, tx_pos, tx_hash, height, value))
+            return utxos
+
+        while True:
+            utxos = await run_in_thread(read_utxos)
+            if all(utxo.tx_hash is not None for utxo in utxos):
+                return utxos
+            self.logger.warning('all_utxos: tx hash not found (reorg?), retrying...')
+            await sleep(0.25)
+
     async def lookup_utxos(self, prevouts):
         '''For each prevout, lookup it up in the DB and return a (hashX,
         value) pair or None if not found.
@@ -714,7 +759,8 @@ class DB(object):
                 prefix = b'h' + tx_hash[:4] + idx_packed
 
                 # Find which entry, if any, the TX_HASH matches.
-                for db_key, hashX in self.utxo_db.iterator(prefix=prefix):
+                for db_key, hashX_with_codescripthash in self.utxo_db.iterator(prefix=prefix):
+                    hashX = hashX_with_codescripthash[:HASHX_LEN]
                     tx_num_packed = db_key[-5:]
                     tx_num, = unpack_le_uint64(tx_num_packed + bytes(3))
                     fs_hash, _height = self.fs_tx_hash(tx_num)
@@ -744,3 +790,29 @@ class DB(object):
 
         hashX_pairs = await run_in_thread(lookup_hashXs)
         return await run_in_thread(lookup_utxos, hashX_pairs)
+
+    def outpoint_to_str(self, outpoint):
+        num, = unpack_le_uint32_from(outpoint[32:])
+        return f'{hash_to_hex_str(outpoint[:32])}i{num}'
+
+    def get_refs_by_outpoint(self, outpoint): 
+        refs = []
+        key = b'ri' + outpoint
+        value = self.utxo_db.get(key)
+        if not value:
+            return []
+        for x in range(0, len(value), 37):
+            ref_id = self.outpoint_to_str(value[x : x + 36])
+            type_byte = value[x + 36: x + 37]
+            ref_type = 'normal'
+            if type_byte == (0).to_bytes(1, "little"):
+                ref_type = 'normal'
+            elif type_byte == (1).to_bytes(1, "little"):
+                ref_type = 'single'
+            else: 
+                raise IndexError(f'fatal unexpected ref type byte')
+            refs.append({
+                'ref': ref_id,
+                'type': ref_type
+            })
+        return refs
