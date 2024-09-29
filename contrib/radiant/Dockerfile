@@ -3,13 +3,13 @@
 # Build with: `docker build -t electrumx .`
 # Public images at: https://hub.docker.com/repository/docker/radiantblockchain
 
-FROM python:3.12
+FROM python:3.11
 
 LABEL maintainer="radiantblockchain@protonmail.com"
 LABEL version="1.2.0"
 LABEL description="Docker image for electrumx radiantd node"
 
-ENV PACKAGES="libleveldb-dev"
+ENV PACKAGES="libleveldb-dev htop net-tools"
 
 RUN apt update && apt install --no-install-recommends -y $PACKAGES  && \
     rm -rf /var/lib/apt/lists/* && \
@@ -26,6 +26,10 @@ COPY . /root/electrumx
 WORKDIR /root/electrumx
 
 RUN python3 -m pip install -r requirements.txt
+# Install py-spy
+# Usage example: py-spy record -o profile.svg --pid 1
+# Only supports up to Python 3.11
+RUN pip install py-spy
 
 # Create SSL
 WORKDIR /root/electrumx
